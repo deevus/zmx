@@ -132,7 +132,7 @@ pub fn main() !void {
         const sesh_env = socket.getSeshNameFromEnv();
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
-        return history(&cfg, sesh, format);
+        return history(&cfg, sesh, format, null);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1108,12 +1108,54 @@ const Daemon = struct {
         client.has_pending_output = true;
     }
 
+    // Exact guidance returned when `-C/--commands` extraction finds no OSC 133
+    // semantic prompts. zmx-spawned shells don't inherit the terminal's shell
+    // integration, so prompt marking must be enabled explicitly.
+    const command_history_guidance =
+        \\no command history: -C/--commands needs OSC 133 shell integration (prompt marking),
+        \\which zmx-spawned shells do not enable automatically. Enable it in the session shell's
+        \\startup — e.g. ghostty + zsh:
+        \\  source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
+        \\Or use plain scrollback: zmx history <session> | tail
+        \\
+    ;
+
     pub fn handleHistory(
         self: *Daemon,
         client: *Client,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        // Commands mode: [format_byte][mode_byte==1][count: u32 LE]. The reply
+        // is prefixed with a 1-byte status (0 = blocks, 1 = guidance).
+        if (payload.len >= 2 and payload[1] == 1) {
+            const count: usize = if (payload.len >= 6)
+                std.mem.readInt(u32, payload[2..6], .little)
+            else
+                0;
+            if (util.serializeCommandBlocks(self.alloc, term, count)) |blocks| {
+                defer self.alloc.free(blocks);
+                const reply = try self.alloc.alloc(u8, blocks.len + 1);
+                defer self.alloc.free(reply);
+                reply[0] = 0;
+                @memcpy(reply[1..], blocks);
+                try ipc.appendMessage(self.alloc, &client.write_buf, .History, reply);
+                client.has_pending_output = true;
+            } else |err| switch (err) {
+                error.NoSemanticPrompts => {
+                    const reply = try self.alloc.alloc(u8, command_history_guidance.len + 1);
+                    defer self.alloc.free(reply);
+                    reply[0] = 1;
+                    @memcpy(reply[1..], command_history_guidance);
+                    try ipc.appendMessage(self.alloc, &client.write_buf, .History, reply);
+                    client.has_pending_output = true;
+                },
+                error.OutOfMemory => return err,
+            }
+            return;
+        }
+
+        // Legacy raw path: [format_byte] (len == 1).
         const format: util.HistoryFormat = if (payload.len > 0)
             std.meta.intToEnum(util.HistoryFormat, payload[0]) catch .plain
         else
@@ -1861,7 +1903,12 @@ fn fetchHistory(
     return error.NoHistoryResponse;
 }
 
-fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
+fn history(
+    cfg: *Cfg,
+    session_name: []const u8,
+    format: util.HistoryFormat,
+    commands_count: ?usize,
+) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1890,11 +1937,26 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     };
     defer posix.close(fd);
 
-    const format_byte = [_]u8{@intFromEnum(format)};
-    ipc.send(fd, .History, &format_byte) catch |err| switch (err) {
-        error.BrokenPipe, error.ConnectionResetByPeer => return,
-        else => return err,
-    };
+    // Raw mode sends a single format byte. Commands mode sends a
+    // length-discriminated payload: [format_byte][mode_byte][count: u32 LE].
+    // Format byte stays first so an old daemon (len==1 fast path) falls back
+    // to raw scrollback rather than misinterpreting the request.
+    if (commands_count) |count| {
+        var payload: [6]u8 = undefined;
+        payload[0] = @intFromEnum(util.HistoryFormat.plain);
+        payload[1] = 1; // mode = commands
+        std.mem.writeInt(u32, payload[2..6], @intCast(count), .little);
+        ipc.send(fd, .History, &payload) catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+    } else {
+        const format_byte = [_]u8{@intFromEnum(format)};
+        ipc.send(fd, .History, &format_byte) catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+    }
 
     var sb = try ipc.SocketBuffer.init(alloc);
     defer sb.deinit();
@@ -1912,8 +1974,22 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
 
         while (sb.next()) |msg| {
             if (msg.header.tag == .History) {
-                _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
-                return;
+                if (commands_count == null) {
+                    // Raw mode: payload is the serialized scrollback verbatim.
+                    _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
+                    return;
+                }
+                // Commands mode: leading status byte. 0 => success (blocks
+                // follow), 1 => guidance text (extraction found no prompts).
+                if (msg.payload.len == 0) return;
+                const status = msg.payload[0];
+                const body = msg.payload[1..];
+                if (status == 0) {
+                    _ = posix.write(posix.STDOUT_FILENO, body) catch return;
+                    return;
+                }
+                _ = posix.write(posix.STDERR_FILENO, body) catch {};
+                return error.NoCommandHistory;
             }
         }
     }
