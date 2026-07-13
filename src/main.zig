@@ -136,7 +136,7 @@ pub fn main() !void {
                 const parsed = std.fmt.parseInt(u32, tok, 10) catch {
                     var buf: [256]u8 = undefined;
                     const msg = std.fmt.bufPrint(&buf, "error: invalid count for -C/--commands: '{s}'", .{tok}) catch "error: invalid count for -C/--commands";
-                    historyUsageError(msg);
+                    return historyUsageError(msg);
                 };
                 if (parsed == 0)
                     return historyUsageError("error: count for -C/--commands must be >= 1");
@@ -1139,35 +1139,37 @@ const Daemon = struct {
         \\
     ;
 
+    // Build a commands-mode reply: a 1-byte status prefix followed by `body`,
+    // queued on the client's write buffer. Both the success and guidance arms
+    // share this shape.
+    fn sendHistoryReply(self: *Daemon, client: *Client, status: util.HistoryStatus, body: []const u8) !void {
+        const reply = try self.alloc.alloc(u8, body.len + 1);
+        defer self.alloc.free(reply);
+        reply[0] = @intFromEnum(status);
+        @memcpy(reply[1..], body);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .History, reply);
+        client.has_pending_output = true;
+    }
+
     pub fn handleHistory(
         self: *Daemon,
         client: *Client,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        // Commands mode: [format_byte][mode_byte==1][count: u32 LE]. The reply
-        // is prefixed with a 1-byte status (0 = blocks, 1 = guidance).
-        if (payload.len >= 2 and payload[1] == 1) {
+        // Commands mode: [format_byte][mode_byte==commands][count: u32 LE]. The
+        // reply is prefixed with a 1-byte status (blocks or guidance).
+        if (payload.len >= 2 and payload[1] == @intFromEnum(util.HistoryMode.commands)) {
             const count: usize = if (payload.len >= 6)
                 std.mem.readInt(u32, payload[2..6], .little)
             else
                 0;
             if (util.serializeCommandBlocks(self.alloc, term, count)) |blocks| {
                 defer self.alloc.free(blocks);
-                const reply = try self.alloc.alloc(u8, blocks.len + 1);
-                defer self.alloc.free(reply);
-                reply[0] = 0;
-                @memcpy(reply[1..], blocks);
-                try ipc.appendMessage(self.alloc, &client.write_buf, .History, reply);
-                client.has_pending_output = true;
+                try self.sendHistoryReply(client, .blocks, blocks);
             } else |err| switch (err) {
                 error.NoSemanticPrompts => {
-                    const reply = try self.alloc.alloc(u8, command_history_guidance.len + 1);
-                    defer self.alloc.free(reply);
-                    reply[0] = 1;
-                    @memcpy(reply[1..], command_history_guidance);
-                    try ipc.appendMessage(self.alloc, &client.write_buf, .History, reply);
-                    client.has_pending_output = true;
+                    try self.sendHistoryReply(client, .guidance, command_history_guidance);
                 },
                 error.OutOfMemory => return err,
             }
@@ -1980,7 +1982,7 @@ fn history(
     if (commands_count) |count| {
         var payload: [6]u8 = undefined;
         payload[0] = @intFromEnum(util.HistoryFormat.plain);
-        payload[1] = 1; // mode = commands
+        payload[1] = @intFromEnum(util.HistoryMode.commands);
         std.mem.writeInt(u32, payload[2..6], @intCast(count), .little);
         ipc.send(fd, .History, &payload) catch |err| switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => return,
@@ -2020,7 +2022,7 @@ fn history(
                 if (msg.payload.len == 0) return;
                 const status = msg.payload[0];
                 const body = msg.payload[1..];
-                if (status == 0) {
+                if (status == @intFromEnum(util.HistoryStatus.blocks)) {
                     _ = posix.write(posix.STDOUT_FILENO, body) catch return;
                     return;
                 }

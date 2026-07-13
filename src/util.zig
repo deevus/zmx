@@ -628,6 +628,12 @@ pub const HistoryFormat = enum(u8) {
     html = 2,
 };
 
+/// IPC wire mode byte for the `history` request payload (byte index 1).
+pub const HistoryMode = enum(u8) { raw = 0, commands = 1 };
+
+/// IPC wire status byte prefixing the `history` reply payload (byte index 0).
+pub const HistoryStatus = enum(u8) { blocks = 0, guidance = 1 };
+
 pub fn serializeTerminal(
     alloc: std.mem.Allocator,
     term: *ghostty_vt.Terminal,
@@ -763,8 +769,9 @@ pub fn serializeCommandBlocks(
             bb.writer.writeByte('\n') catch return error.OutOfMemory;
         }
 
-        const block_text = alloc.dupe(u8, bb.writer.buffered()) catch
-            return error.OutOfMemory;
+        // Hand off the writer's buffer directly instead of dupe+copy.
+        // toOwnedSlice resets `bb` to empty, so `defer bb.deinit()` stays safe.
+        const block_text = bb.toOwnedSlice() catch return error.OutOfMemory;
         blocks.append(alloc, block_text) catch {
             alloc.free(block_text);
             return error.OutOfMemory;
@@ -1684,6 +1691,19 @@ test "serializeCommandBlocks returns all blocks chronologically when N exceeds c
         "echo hi\nhi\n\nls -la\nfile1\nfile2\n",
         out,
     );
+}
+
+test "serializeCommandBlocks returns empty string for N=0 even with prompts" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_block1 ++ osc_block2 ++ osc_trailer);
+    defer term.deinit(alloc);
+
+    // n == 0 yields an empty result, NOT error.NoSemanticPrompts, even when
+    // OSC 133 semantic prompts are present.
+    const result = try serializeCommandBlocks(alloc, &term, 0);
+    defer alloc.free(result);
+
+    try std.testing.expectEqualStrings("", result);
 }
 
 test "serializeCommandBlocks errors when no semantic prompts present" {
