@@ -40,9 +40,13 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|kill|history)
+    \\    attach|run|send|kill)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
+    \\      ;;
+    \\    history)
+    \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
+    \\      COMPREPLY=($(compgen -W "$sessions -C --commands" -- "$cur"))
     \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
@@ -89,8 +93,12 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|history|hi)
+    \\        attach|a|kill|k|run|r|send|s)
     \\          _zmx_sessions
+    \\          ;;
+    \\        history|hi)
+    \\          _zmx_sessions
+    \\          _values 'options' '-C' '--commands'
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
@@ -155,6 +163,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from k kill" -l force -d 'Force kill'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
+    \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -s C -l commands -d 'Output last N command blocks'
 ;
 
 const nu_completions =
@@ -190,7 +199,12 @@ const nu_completions =
     \\
     \\export extern "zmx detach" []
     \\export extern "zmx list" [--short]
-    \\export extern "zmx history" [name: string@"nu-complete zmx sessions", --vt, --html]
+    \\export extern "zmx history" [
+    \\    name: string@"nu-complete zmx sessions"
+    \\    --vt
+    \\    --html
+    \\    --commands(-C): int # Output the last N command blocks
+    \\]
     \\export extern "zmx wait" [...sessions: string@"nu-complete zmx sessions"]
     \\export extern "zmx tail" [...sessions: string@"nu-complete zmx sessions"]
     \\export extern "zmx version" []

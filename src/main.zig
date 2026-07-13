@@ -118,21 +118,40 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "history") or std.mem.eql(u8, cmd, "hi")) {
         var session_name: ?[]const u8 = null;
         var format: util.HistoryFormat = .plain;
+        var format_explicit = false;
+        var commands_count: ?usize = null;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 return help();
             } else if (std.mem.eql(u8, arg, "--vt")) {
                 format = .vt;
+                format_explicit = true;
             } else if (std.mem.eql(u8, arg, "--html")) {
                 format = .html;
+                format_explicit = true;
+            } else if (std.mem.eql(u8, arg, "-C") or std.mem.eql(u8, arg, "--commands")) {
+                const tok = args.next() orelse
+                    return historyUsageError("error: -C/--commands requires a count");
+                // parseInt(u32) rejects overflow (> 4294967295) as error.Overflow.
+                const parsed = std.fmt.parseInt(u32, tok, 10) catch {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "error: invalid count for -C/--commands: '{s}'", .{tok}) catch "error: invalid count for -C/--commands";
+                    historyUsageError(msg);
+                };
+                if (parsed == 0)
+                    return historyUsageError("error: count for -C/--commands must be >= 1");
+                commands_count = parsed;
             } else if (session_name == null) {
                 session_name = arg;
             }
         }
+        // Enforced after the loop so order of -C vs --vt/--html does not matter.
+        if (commands_count != null and format_explicit)
+            return historyUsageError("error: -C/--commands cannot be combined with --vt/--html");
         const sesh_env = socket.getSeshNameFromEnv();
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
-        return history(&cfg, sesh, format, null);
+        return history(&cfg, sesh, format, commands_count);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1301,7 +1320,7 @@ fn help() !void {
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
-        \\  [hi]story <name> [--vt|--html]           Output session scrollback
+        \\  [hi]story <name> [--vt|--html|-C N]      Output session scrollback
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
@@ -1320,8 +1339,15 @@ fn help() !void {
         \\  This should generally be used with `tail` to print the last lines
         \\  of the session's scrollback history.
         \\
+        \\  `-C N` / `--commands N` outputs the last N command blocks (each
+        \\  command plus its output).  Requires OSC 133 shell integration
+        \\  (prompt marking) in the session's shell; zmx-spawned shells do not
+        \\  enable it automatically.  Plain text only -- cannot be combined
+        \\  with `--vt` or `--html`.
+        \\
         \\  Examples:
         \\    zmx history <session> | tail -100
+        \\    zmx history <session> -C 5
         \\
         \\Run:
         \\  Commands run inside a PTY using bash
@@ -1903,6 +1929,14 @@ fn fetchHistory(
     return error.NoHistoryResponse;
 }
 
+fn historyUsageError(msg: []const u8) noreturn {
+    var buf: [256]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("{s}\n", .{msg}) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
+}
+
 fn history(
     cfg: *Cfg,
     session_name: []const u8,
@@ -1939,8 +1973,10 @@ fn history(
 
     // Raw mode sends a single format byte. Commands mode sends a
     // length-discriminated payload: [format_byte][mode_byte][count: u32 LE].
-    // Format byte stays first so an old daemon (len==1 fast path) falls back
-    // to raw scrollback rather than misinterpreting the request.
+    // Format byte stays first only so an OLD daemon (len==1 fast path) won't
+    // misframe the request; a new client in commands mode still strips the
+    // first reply byte as a status byte, so this is not graceful cross-version
+    // degradation (backward-compat is not a goal).
     if (commands_count) |count| {
         var payload: [6]u8 = undefined;
         payload[0] = @intFromEnum(util.HistoryFormat.plain);
@@ -1989,7 +2025,7 @@ fn history(
                     return;
                 }
                 _ = posix.write(posix.STDERR_FILENO, body) catch {};
-                return error.NoCommandHistory;
+                std.process.exit(1);
             }
         }
     }
