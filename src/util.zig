@@ -671,6 +671,126 @@ pub fn serializeTerminal(
     };
 }
 
+pub const CommandExtractError = error{ NoSemanticPrompts, OutOfMemory };
+
+/// Extract the text of a single semantic zone (`.input` or `.output`) anchored
+/// at a prompt-start pin. Returns null if the zone is absent or empty after
+/// trimming. Caller owns the returned slice.
+///
+/// `pin` MUST be a prompt-start row produced by `promptIterator`, because
+/// `highlightSemanticContent` asserts this.
+fn extractZoneText(
+    alloc: std.mem.Allocator,
+    screen: *ghostty_vt.Screen,
+    pages: *const ghostty_vt.PageList,
+    pin: ghostty_vt.Pin,
+    content: ghostty_vt.Cell.SemanticContent,
+) CommandExtractError!?[:0]const u8 {
+    const zone = pages.highlightSemanticContent(pin, content) orelse return null;
+    const sel = ghostty_vt.Selection.init(zone.start, zone.end, false);
+    // selectionString handles UTF-8, soft-wrap unwrapping, graphemes, and
+    // wide-cell spacers, so we never hand-walk cells here.
+    const s = screen.selectionString(alloc, .{ .sel = sel, .trim = true }) catch
+        return error.OutOfMemory;
+    if (s.len == 0) {
+        alloc.free(s);
+        return null;
+    }
+    return s;
+}
+
+/// Extract the last `n` command blocks from the terminal scrollback as plain
+/// text. A block = the OSC 133 `.input` (typed command) followed by its
+/// `.output`. Blocks are emitted in chronological (oldest -> newest) order and
+/// separated by exactly one blank line. Returns error.NoSemanticPrompts if the
+/// buffer has no OSC 133 semantic prompts. Caller owns the returned slice.
+///
+/// `n` is expected to be >= 1 (the CLI enforces this); `n == 0` yields an empty
+/// result rather than an error, since requesting zero blocks is not a signal
+/// that prompts are absent.
+pub fn serializeCommandBlocks(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    n: usize,
+) CommandExtractError![]const u8 {
+    // Requesting zero blocks yields an empty result. Handled explicitly so the
+    // `saw_any_prompt` check below never runs with an unentered loop, which
+    // would otherwise misreport error.NoSemanticPrompts even when prompts exist.
+    if (n == 0) return alloc.dupe(u8, "") catch return error.OutOfMemory;
+
+    const screen = term.screens.active;
+    const pages = &screen.pages;
+
+    // `.left_up` yields prompt-start rows newest-first.
+    var it = pages.promptIterator(
+        .left_up,
+        .{ .screen = .{ .x = 0, .y = 0 } },
+        null,
+    );
+
+    // Rendered blocks, newest-first. Each entry owns its text.
+    var blocks: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (blocks.items) |b| alloc.free(b);
+        blocks.deinit(alloc);
+    }
+
+    // Walk prompts newest-first, collecting up to `n` NON-EMPTY blocks. An
+    // in-progress prompt at the bottom of a live terminal has no input/output
+    // yet and must not consume one of the `n` slots, so empty blocks are
+    // skipped without counting rather than dropped after the fact.
+    var saw_any_prompt = false;
+    while (blocks.items.len < n) {
+        const pin = it.next() orelse break;
+        saw_any_prompt = true;
+
+        const cmd = try extractZoneText(alloc, screen, pages, pin, .input);
+        defer if (cmd) |s| alloc.free(s);
+        const out = try extractZoneText(alloc, screen, pages, pin, .output);
+        defer if (out) |s| alloc.free(s);
+
+        // Omit the whole block if both zones are empty.
+        if (cmd == null and out == null) continue;
+
+        var bb: std.Io.Writer.Allocating = .init(alloc);
+        defer bb.deinit();
+        if (cmd) |s| {
+            bb.writer.writeAll(s) catch return error.OutOfMemory;
+            bb.writer.writeByte('\n') catch return error.OutOfMemory;
+        }
+        if (out) |s| {
+            bb.writer.writeAll(s) catch return error.OutOfMemory;
+            bb.writer.writeByte('\n') catch return error.OutOfMemory;
+        }
+
+        const block_text = alloc.dupe(u8, bb.writer.buffered()) catch
+            return error.OutOfMemory;
+        blocks.append(alloc, block_text) catch {
+            alloc.free(block_text);
+            return error.OutOfMemory;
+        };
+    }
+
+    // No semantic prompts at all: signal to the caller.
+    if (!saw_any_prompt) return error.NoSemanticPrompts;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // Emit chronological (oldest -> newest): reverse of newest-first.
+    // Consecutive blocks are separated by exactly one blank line.
+    var i: usize = blocks.items.len;
+    var first = true;
+    while (i > 0) {
+        i -= 1;
+        if (!first) builder.writer.writeByte('\n') catch return error.OutOfMemory;
+        first = false;
+        builder.writer.writeAll(blocks.items[i]) catch return error.OutOfMemory;
+    }
+
+    return alloc.dupe(u8, builder.writer.buffered()) catch return error.OutOfMemory;
+}
+
 pub fn detectShell() [:0]const u8 {
     return std.posix.getenv("SHELL") orelse "/bin/sh";
 }
@@ -1524,4 +1644,108 @@ test "stripAnsi: only escape sequences" {
     const result = try stripAnsi(alloc, "\x1b[31m\x1b[1m\x1b[0m");
     defer alloc.free(result);
     try testing.expectEqualStrings("", result);
+}
+
+// OSC 133 semantic prompt markers: ;A = prompt start, ;B = prompt end / input
+// start, ;C = command output start. A block is a `;A` prompt, a typed command
+// after `;B`, and its output after `;C`. Starting the next block with `;A`
+// closes the previous output zone.
+const osc_block1 = "\x1b]133;A\x07" ++ "user@host$ " ++
+    "\x1b]133;B\x07" ++ "echo hi\r\n" ++
+    "\x1b]133;C\x07" ++ "hi\r\n";
+const osc_block2 = "\x1b]133;A\x07" ++ "user@host$ " ++
+    "\x1b]133;B\x07" ++ "ls -la\r\n" ++
+    "\x1b]133;C\x07" ++ "file1\r\nfile2\r\n";
+// A fresh in-progress prompt awaiting input, as a live terminal would have.
+const osc_trailer = "\x1b]133;A\x07" ++ "user@host$ ";
+
+test "serializeCommandBlocks returns newest block for N=1" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_block1 ++ osc_block2 ++ osc_trailer);
+    defer term.deinit(alloc);
+
+    const out = try serializeCommandBlocks(alloc, &term, 1);
+    defer alloc.free(out);
+
+    // Only the newest real command block; the empty trailing prompt is skipped.
+    try testing.expectEqualStrings("ls -la\nfile1\nfile2\n", out);
+}
+
+test "serializeCommandBlocks returns all blocks chronologically when N exceeds count" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_block1 ++ osc_block2 ++ osc_trailer);
+    defer term.deinit(alloc);
+
+    const out = try serializeCommandBlocks(alloc, &term, 100);
+    defer alloc.free(out);
+
+    // Oldest -> newest, separated by exactly one blank line.
+    try testing.expectEqualStrings(
+        "echo hi\nhi\n\nls -la\nfile1\nfile2\n",
+        out,
+    );
+}
+
+test "serializeCommandBlocks errors when no semantic prompts present" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, "just some plain text\r\nno prompts here\r\n");
+    defer term.deinit(alloc);
+
+    try testing.expectError(
+        error.NoSemanticPrompts,
+        serializeCommandBlocks(alloc, &term, 5),
+    );
+}
+
+test "serializeCommandBlocks handles trailing command with no output" {
+    const alloc = testing.allocator;
+    // block1 completes; the final block has a command but no `;C` output yet.
+    const pending = "\x1b]133;A\x07" ++ "user@host$ " ++
+        "\x1b]133;B\x07" ++ "make build\r\n";
+    var term = try testCreateTerminal(alloc, 80, 24, osc_block1 ++ pending);
+    defer term.deinit(alloc);
+
+    const out = try serializeCommandBlocks(alloc, &term, 1);
+    defer alloc.free(out);
+
+    // Command only, no output line, no crash, no spurious content.
+    try testing.expectEqualStrings("make build\n", out);
+}
+
+test "serializeCommandBlocks handles output with no command" {
+    const alloc = testing.allocator;
+    // A block with a prompt start and command-output start but no `;B`, so the
+    // `.input` zone is absent while `.output` is present (e.g. a program that
+    // emitted OSC 133;C without a marked command line). The following `;A`
+    // closes the output zone.
+    const no_input = "\x1b]133;A\x07" ++ "user@host$ " ++
+        "\x1b]133;C\x07" ++ "output without a command\r\n" ++
+        "\x1b]133;A\x07" ++ "user@host$ ";
+    var term = try testCreateTerminal(alloc, 80, 24, no_input);
+    defer term.deinit(alloc);
+
+    const out = try serializeCommandBlocks(alloc, &term, 1);
+    defer alloc.free(out);
+
+    // Output only, no leading command line, no crash.
+    try testing.expectEqualStrings("output without a command\n", out);
+}
+
+test "serializeCommandBlocks unwraps soft-wrapped command into one logical line" {
+    const alloc = testing.allocator;
+    // A narrow terminal forces the typed command to soft-wrap across rows. The
+    // command (16 printable chars) exceeds the 10-column width, so it spans two
+    // rows without any hard newline being typed.
+    const wrapped = "\x1b]133;A\x07" ++ "\x1b]133;B\x07" ++
+        "abcdefghijklmnop\r\n" ++
+        "\x1b]133;C\x07" ++ "\x1b]133;A\x07";
+    var term = try testCreateTerminal(alloc, 10, 24, wrapped);
+    defer term.deinit(alloc);
+
+    const out = try serializeCommandBlocks(alloc, &term, 1);
+    defer alloc.free(out);
+
+    // selectionString unwraps the soft break: the command comes back as one
+    // logical line, with no hard newline injected at the wrap point.
+    try testing.expectEqualStrings("abcdefghijklmnop\n", out);
 }
