@@ -119,7 +119,7 @@ pub fn main() !void {
         var session_name: ?[]const u8 = null;
         var format: util.HistoryFormat = .plain;
         var format_explicit = false;
-        var commands_count: ?usize = null;
+        var commands_range: ?util.CommandRange = null;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 return help();
@@ -129,31 +129,60 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, arg, "--html")) {
                 format = .html;
                 format_explicit = true;
-            } else if (std.mem.eql(u8, arg, "-C") or std.mem.eql(u8, arg, "--commands")) {
+            } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--commands")) {
                 const tok = args.next() orelse
-                    return historyUsageError("error: -C/--commands requires a count");
-                // parseInt(u32) rejects overflow (> 4294967295) as error.Overflow.
-                const parsed = std.fmt.parseInt(u32, tok, 10) catch {
-                    var buf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "error: invalid count for -C/--commands: '{s}'", .{tok}) catch "error: invalid count for -C/--commands";
-                    return historyUsageError(msg);
-                };
-                if (parsed == 0)
-                    return historyUsageError("error: count for -C/--commands must be >= 1");
-                commands_count = parsed;
+                    return historyUsageError("error: -n/--commands requires a count or M..N range");
+                var buf: [256]u8 = undefined;
+                const invalid = std.fmt.bufPrint(&buf, "error: invalid count or range for -n/--commands: '{s}'", .{tok}) catch "error: invalid count or range for -n/--commands";
+                if (std.mem.indexOf(u8, tok, "..")) |sep| {
+                    // Recency range M..N: both bounds required (no open-ended forms).
+                    const m_str = tok[0..sep];
+                    const n_str = tok[sep + 2 ..];
+                    // Digit-only guard rejects empty (open-ended "2..", "..4", ".."),
+                    // signs ("+3"), and non-numeric ("a..b"); a stray trailing "..N"
+                    // (e.g. "1..2..3") lands non-digits in n_str and is rejected too.
+                    if (!isAllDigits(m_str) or !isAllDigits(n_str))
+                        return historyUsageError(invalid);
+                    // parseInt still guards overflow (> 4294967295 -> error.Overflow).
+                    const m = std.fmt.parseInt(u32, m_str, 10) catch
+                        return historyUsageError(invalid);
+                    const n = std.fmt.parseInt(u32, n_str, 10) catch
+                        return historyUsageError(invalid);
+                    if (m == 0 or n == 0)
+                        return historyUsageError("error: -n/--commands values must be >= 1");
+                    if (m > n) {
+                        var range_buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&range_buf, "error: -n/--commands range start must be <= end: '{s}'", .{tok}) catch "error: -n/--commands range start must be <= end";
+                        return historyUsageError(msg);
+                    }
+                    commands_range = .{ .start = m, .end = n };
+                } else {
+                    // Bare count N -> recency range [1, N]. Digit-only guard
+                    // rejects signs ("+3") and non-numeric ("abc").
+                    if (!isAllDigits(tok))
+                        return historyUsageError(invalid);
+                    // parseInt still guards overflow (> 4294967295 -> error.Overflow).
+                    const n = std.fmt.parseInt(u32, tok, 10) catch
+                        return historyUsageError(invalid);
+                    if (n == 0)
+                        return historyUsageError("error: -n/--commands values must be >= 1");
+                    commands_range = .{ .start = 1, .end = n };
+                }
+            } else if (std.mem.startsWith(u8, arg, "-")) {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "error: unknown option '{s}' for history", .{arg}) catch "error: unknown option for history";
+                return historyUsageError(msg);
             } else if (session_name == null) {
                 session_name = arg;
             }
         }
-        // Enforced after the loop so order of -C vs --vt/--html does not matter.
-        if (commands_count != null and format_explicit)
-            return historyUsageError("error: -C/--commands cannot be combined with --vt/--html");
+        // Enforced after the loop so order of -n vs --vt/--html does not matter.
+        if (commands_range != null and format_explicit)
+            return historyUsageError("error: -n/--commands cannot be combined with --vt/--html");
         const sesh_env = socket.getSeshNameFromEnv();
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
-        // TODO(cli): construct util.CommandRange from -C (bare N -> {1, N};
-        // M..N -> {M, N}) and pass it here. Wired null until the CLI task lands.
-        return history(&cfg, sesh, format, null);
+        return history(&cfg, sesh, format, commands_range);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1129,11 +1158,11 @@ const Daemon = struct {
         client.has_pending_output = true;
     }
 
-    // Exact guidance returned when `-C/--commands` extraction finds no OSC 133
+    // Exact guidance returned when `-n/--commands` extraction finds no OSC 133
     // semantic prompts. zmx-spawned shells don't inherit the terminal's shell
     // integration, so prompt marking must be enabled explicitly.
     const command_history_guidance =
-        \\no command history: -C/--commands needs OSC 133 shell integration (prompt marking),
+        \\no command history: -n/--commands needs OSC 133 shell integration (prompt marking),
         \\which zmx-spawned shells do not enable automatically. Enable it in the session shell's
         \\startup — e.g. ghostty + zsh:
         \\  source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
@@ -1324,7 +1353,7 @@ fn help() !void {
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
-        \\  [hi]story <name> [--vt|--html|-C N]      Output session scrollback
+        \\  [hi]story <name> [--vt|--html|-n N|M..N] Output session scrollback
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
@@ -1343,15 +1372,16 @@ fn help() !void {
         \\  This should generally be used with `tail` to print the last lines
         \\  of the session's scrollback history.
         \\
-        \\  `-C N` / `--commands N` outputs the last N command blocks (each
-        \\  command plus its output).  Requires OSC 133 shell integration
-        \\  (prompt marking) in the session's shell; zmx-spawned shells do not
-        \\  enable it automatically.  Plain text only -- cannot be combined
-        \\  with `--vt` or `--html`.
+        \\  `-n N` / `--commands N` outputs the last N command blocks; `-n M..N`
+        \\  selects a recency range (1 = most recent, inclusive).  Requires OSC
+        \\  133 shell integration in the session's shell (zmx-spawned shells
+        \\  don't enable it automatically).  Plain text only; cannot be combined
+        \\  with `--vt`/`--html`.
         \\
         \\  Examples:
         \\    zmx history <session> | tail -100
-        \\    zmx history <session> -C 5
+        \\    zmx history <session> -n 5
+        \\    zmx history <session> -n 2..4
         \\
         \\Run:
         \\  Commands run inside a PTY using bash
@@ -1931,6 +1961,17 @@ fn fetchHistory(
     }
 
     return error.NoHistoryResponse;
+}
+
+/// True only for a non-empty run of ASCII digits. Used to reject `-n` values
+/// with a leading sign (`+3`) or non-numeric characters before parseInt, whose
+/// sign handling would otherwise accept `+3` as 3.
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 fn historyUsageError(msg: []const u8) noreturn {

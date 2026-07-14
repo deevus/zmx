@@ -46,7 +46,7 @@ const bash_completions =
     \\      ;;
     \\    history)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
-    \\      COMPREPLY=($(compgen -W "$sessions -C --commands" -- "$cur"))
+    \\      COMPREPLY=($(compgen -W "$sessions -n --commands" -- "$cur"))
     \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
@@ -98,7 +98,7 @@ const zsh_completions =
     \\          ;;
     \\        history|hi)
     \\          _zmx_sessions
-    \\          _values 'options' '-C' '--commands'
+    \\          _values 'options' '-n' '--commands'
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
@@ -163,7 +163,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from k kill" -l force -d 'Force kill'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
-    \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -s C -l commands -d 'Output last N command blocks'
+    \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -s n -l commands -d 'Output last N command blocks or M..N range'
 ;
 
 const nu_completions =
@@ -203,7 +203,7 @@ const nu_completions =
     \\    name: string@"nu-complete zmx sessions"
     \\    --vt
     \\    --html
-    \\    --commands(-C): int # Output the last N command blocks
+    \\    --commands(-n): string # Output the last N command blocks or an M..N recency range
     \\]
     \\export extern "zmx wait" [...sessions: string@"nu-complete zmx sessions"]
     \\export extern "zmx tail" [...sessions: string@"nu-complete zmx sessions"]
