@@ -634,6 +634,11 @@ pub const HistoryMode = enum(u8) { raw = 0, commands = 1 };
 /// IPC wire status byte prefixing the `history` reply payload (byte index 0).
 pub const HistoryStatus = enum(u8) { blocks = 0, guidance = 1 };
 
+/// Recency range for command-block extraction: 1-based, 1 = newest, inclusive.
+/// A bare `-C N` maps to `{ .start = 1, .end = N }`; `-C M..N` to `{ .start = M,
+/// .end = N }`. Carried on the wire as two little-endian u32s.
+pub const CommandRange = struct { start: u32, end: u32 };
+
 pub fn serializeTerminal(
     alloc: std.mem.Allocator,
     term: *ghostty_vt.Terminal,

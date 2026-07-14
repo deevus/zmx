@@ -151,7 +151,9 @@ pub fn main() !void {
         const sesh_env = socket.getSeshNameFromEnv();
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
-        return history(&cfg, sesh, format, commands_count);
+        // TODO(cli): construct util.CommandRange from -C (bare N -> {1, N};
+        // M..N -> {M, N}) and pass it here. Wired null until the CLI task lands.
+        return history(&cfg, sesh, format, null);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1157,14 +1159,14 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        // Commands mode: [format_byte][mode_byte==commands][count: u32 LE]. The
+        // Raw (1-byte) and commands (10-byte) requests share the `.History` tag
+        // and are distinguished by length + mode byte. Commands mode:
+        // [format_byte][mode_byte==commands][start: u32 LE][end: u32 LE]. The
         // reply is prefixed with a 1-byte status (blocks or guidance).
-        if (payload.len >= 2 and payload[1] == @intFromEnum(util.HistoryMode.commands)) {
-            const count: usize = if (payload.len >= 6)
-                std.mem.readInt(u32, payload[2..6], .little)
-            else
-                0;
-            if (util.serializeCommandBlocks(self.alloc, term, count)) |blocks| {
+        if (payload.len >= 10 and payload[1] == @intFromEnum(util.HistoryMode.commands)) {
+            const start = std.mem.readInt(u32, payload[2..6], .little);
+            const end = std.mem.readInt(u32, payload[6..10], .little);
+            if (util.serializeCommandRange(self.alloc, term, start, end)) |blocks| {
                 defer self.alloc.free(blocks);
                 try self.sendHistoryReply(client, .blocks, blocks);
             } else |err| switch (err) {
@@ -1176,7 +1178,7 @@ const Daemon = struct {
             return;
         }
 
-        // Legacy raw path: [format_byte] (len == 1).
+        // Raw path: [format_byte] (len == 1).
         const format: util.HistoryFormat = if (payload.len > 0)
             std.meta.intToEnum(util.HistoryFormat, payload[0]) catch .plain
         else
@@ -1943,7 +1945,7 @@ fn history(
     cfg: *Cfg,
     session_name: []const u8,
     format: util.HistoryFormat,
-    commands_count: ?usize,
+    commands_range: ?util.CommandRange,
 ) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1973,17 +1975,15 @@ fn history(
     };
     defer posix.close(fd);
 
-    // Raw mode sends a single format byte. Commands mode sends a
-    // length-discriminated payload: [format_byte][mode_byte][count: u32 LE].
-    // Format byte stays first only so an OLD daemon (len==1 fast path) won't
-    // misframe the request; a new client in commands mode still strips the
-    // first reply byte as a status byte, so this is not graceful cross-version
-    // degradation (backward-compat is not a goal).
-    if (commands_count) |count| {
-        var payload: [6]u8 = undefined;
+    // Both request shapes share the `.History` tag and are distinguished by
+    // length + mode byte: raw is a single format byte (len == 1); commands is
+    // [format=plain][mode=commands][start: u32 LE][end: u32 LE] (len == 10).
+    if (commands_range) |range| {
+        var payload: [10]u8 = undefined;
         payload[0] = @intFromEnum(util.HistoryFormat.plain);
         payload[1] = @intFromEnum(util.HistoryMode.commands);
-        std.mem.writeInt(u32, payload[2..6], @intCast(count), .little);
+        std.mem.writeInt(u32, payload[2..6], range.start, .little);
+        std.mem.writeInt(u32, payload[6..10], range.end, .little);
         ipc.send(fd, .History, &payload) catch |err| switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => return,
             else => return err,
@@ -2012,7 +2012,7 @@ fn history(
 
         while (sb.next()) |msg| {
             if (msg.header.tag == .History) {
-                if (commands_count == null) {
+                if (commands_range == null) {
                     // Raw mode: payload is the serialized scrollback verbatim.
                     _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
                     return;
