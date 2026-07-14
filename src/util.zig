@@ -705,25 +705,23 @@ fn extractZoneText(
     return s;
 }
 
-/// Extract the last `n` command blocks from the terminal scrollback as plain
-/// text. A block = the OSC 133 `.input` (typed command) followed by its
-/// `.output`. Blocks are emitted in chronological (oldest -> newest) order and
-/// separated by exactly one blank line. Returns error.NoSemanticPrompts if the
-/// buffer has no OSC 133 semantic prompts. Caller owns the returned slice.
+/// Walk prompts newest-first, appending up to `max_blocks` rendered NON-EMPTY
+/// block texts (in newest-first order) to `blocks`. Each appended slice is a
+/// block = the OSC 133 `.input` (typed command) followed by its `.output`, with
+/// each present zone written as `zone\n`, and is owned by `alloc`.
 ///
-/// `n` is expected to be >= 1 (the CLI enforces this); `n == 0` yields an empty
-/// result rather than an error, since requesting zero blocks is not a signal
-/// that prompts are absent.
-pub fn serializeCommandBlocks(
+/// An in-progress prompt at the bottom of a live terminal (or a prompt with
+/// neither command nor output) is empty; it is skipped WITHOUT consuming a slot
+/// and does not receive a recency index. Returns true if at least one OSC 133
+/// prompt was seen at all (even one that produced no non-empty block), so
+/// callers can tell "no semantic prompts at all" apart from "prompts present
+/// but nothing to emit".
+fn collectCommandBlocks(
     alloc: std.mem.Allocator,
     term: *ghostty_vt.Terminal,
-    n: usize,
-) CommandExtractError![]const u8 {
-    // Requesting zero blocks yields an empty result. Handled explicitly so the
-    // `saw_any_prompt` check below never runs with an unentered loop, which
-    // would otherwise misreport error.NoSemanticPrompts even when prompts exist.
-    if (n == 0) return alloc.dupe(u8, "") catch return error.OutOfMemory;
-
+    max_blocks: usize,
+    blocks: *std.ArrayList([]const u8),
+) CommandExtractError!bool {
     const screen = term.screens.active;
     const pages = &screen.pages;
 
@@ -734,19 +732,8 @@ pub fn serializeCommandBlocks(
         null,
     );
 
-    // Rendered blocks, newest-first. Each entry owns its text.
-    var blocks: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (blocks.items) |b| alloc.free(b);
-        blocks.deinit(alloc);
-    }
-
-    // Walk prompts newest-first, collecting up to `n` NON-EMPTY blocks. An
-    // in-progress prompt at the bottom of a live terminal has no input/output
-    // yet and must not consume one of the `n` slots, so empty blocks are
-    // skipped without counting rather than dropped after the fact.
     var saw_any_prompt = false;
-    while (blocks.items.len < n) {
+    while (blocks.items.len < max_blocks) {
         const pin = it.next() orelse break;
         saw_any_prompt = true;
 
@@ -755,7 +742,7 @@ pub fn serializeCommandBlocks(
         const out = try extractZoneText(alloc, screen, pages, pin, .output);
         defer if (out) |s| alloc.free(s);
 
-        // Omit the whole block if both zones are empty.
+        // Omit the whole block if both zones are empty (does not count).
         if (cmd == null and out == null) continue;
 
         var bb: std.Io.Writer.Allocating = .init(alloc);
@@ -778,17 +765,59 @@ pub fn serializeCommandBlocks(
         };
     }
 
-    // No semantic prompts at all: signal to the caller.
+    return saw_any_prompt;
+}
+
+/// Extract command blocks whose recency index is in [start, end] (1-based,
+/// inclusive; recency index 1 = the most recent command block). Blocks are
+/// emitted chronologically (oldest -> newest). Empty/in-progress blocks
+/// (a live terminal's trailing prompt, or a prompt with neither command nor
+/// output) are skipped and do NOT get a recency index. Returns
+/// error.NoSemanticPrompts if the buffer has no OSC 133 semantic prompts.
+/// Requires 1 <= start <= end (callers validate). Caller owns the returned slice.
+pub fn serializeCommandRange(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    start: usize,
+    end: usize,
+) CommandExtractError![]const u8 {
+    // An empty range yields an empty result rather than an error. This also
+    // absorbs the `n == 0` delegation from serializeCommandBlocks (start=1,
+    // end=0): requesting zero blocks is not a signal that prompts are absent,
+    // and we must decide this BEFORE the NoSemanticPrompts check below.
+    if (start > end) return alloc.dupe(u8, "") catch return error.OutOfMemory;
+
+    // We only need blocks up to recency index `end`, so cap collection there.
+    // This also clamps `end` to the number of available blocks implicitly: we
+    // can never collect more non-empty blocks than exist.
+    var blocks: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (blocks.items) |b| alloc.free(b);
+        blocks.deinit(alloc);
+    }
+
+    const saw_any_prompt = try collectCommandBlocks(alloc, term, end, &blocks);
+
+    // No semantic prompts at all: signal to the caller. (Prompts present but all
+    // empty falls through to the empty-range case below, not an error.)
     if (!saw_any_prompt) return error.NoSemanticPrompts;
+
+    // `blocks` is newest-first: index i holds recency index i+1. If `start` is
+    // past the last available block, the requested range is empty.
+    const available = blocks.items.len;
+    if (start > available) return alloc.dupe(u8, "") catch return error.OutOfMemory;
 
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
-    // Emit chronological (oldest -> newest): reverse of newest-first.
-    // Consecutive blocks are separated by exactly one blank line.
-    var i: usize = blocks.items.len;
+    // Selected recency indices are [start, available] (end already clamped by
+    // collection), i.e. blocks.items[start-1 .. available] in newest-first
+    // order. Emit chronological (oldest -> newest): the oldest selected block
+    // has the highest recency index, so walk that slice from its tail down to
+    // `start-1`, separating consecutive blocks by exactly one blank line.
+    var i: usize = available;
     var first = true;
-    while (i > 0) {
+    while (i > start - 1) {
         i -= 1;
         if (!first) builder.writer.writeByte('\n') catch return error.OutOfMemory;
         first = false;
@@ -796,6 +825,27 @@ pub fn serializeCommandBlocks(
     }
 
     return alloc.dupe(u8, builder.writer.buffered()) catch return error.OutOfMemory;
+}
+
+/// Extract the last `n` command blocks from the terminal scrollback as plain
+/// text. A block = the OSC 133 `.input` (typed command) followed by its
+/// `.output`. Blocks are emitted in chronological (oldest -> newest) order and
+/// separated by exactly one blank line. Returns error.NoSemanticPrompts if the
+/// buffer has no OSC 133 semantic prompts. Caller owns the returned slice.
+///
+/// `n` is expected to be >= 1 (the CLI enforces this); `n == 0` yields an empty
+/// result rather than an error, since requesting zero blocks is not a signal
+/// that prompts are absent.
+///
+/// This is the `[1, n]` special case of `serializeCommandRange`. The `n == 0`
+/// contract is preserved because `serializeCommandRange(.., 1, 0)` has
+/// start > end and returns "" before touching the prompt buffer.
+pub fn serializeCommandBlocks(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    n: usize,
+) CommandExtractError![]const u8 {
+    return serializeCommandRange(alloc, term, 1, n);
 }
 
 pub fn detectShell() [:0]const u8 {
@@ -1768,4 +1818,84 @@ test "serializeCommandBlocks unwraps soft-wrapped command into one logical line"
     // selectionString unwraps the soft break: the command comes back as one
     // logical line, with no hard newline injected at the wrap point.
     try testing.expectEqualStrings("abcdefghijklmnop\n", out);
+}
+
+// Four distinct completed command blocks plus a trailing in-progress prompt.
+// Recency indices (newest = 1): four = 1, three = 2, two = 3, one = 4.
+fn oscCmdBlock(comptime cmd: []const u8, comptime output: []const u8) []const u8 {
+    return "\x1b]133;A\x07" ++ "user@host$ " ++
+        "\x1b]133;B\x07" ++ cmd ++ "\r\n" ++
+        "\x1b]133;C\x07" ++ output ++ "\r\n";
+}
+const osc_range_session = oscCmdBlock("echo one", "one") ++
+    oscCmdBlock("echo two", "two") ++
+    oscCmdBlock("echo three", "three") ++
+    oscCmdBlock("echo four", "four") ++
+    "\x1b]133;A\x07" ++ "user@host$ "; // trailing in-progress prompt
+
+test "serializeCommandRange returns the 2nd and 3rd most-recent blocks chronologically" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_range_session);
+    defer term.deinit(alloc);
+
+    // Recency 2 = "three", recency 3 = "two". Emitted oldest -> newest, so the
+    // older ("two") comes first, separated by exactly one blank line.
+    const out = try serializeCommandRange(alloc, &term, 2, 3);
+    defer alloc.free(out);
+
+    try testing.expectEqualStrings(
+        "echo two\ntwo\n\necho three\nthree\n",
+        out,
+    );
+}
+
+test "serializeCommandRange with start=end=1 returns just the newest block" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_range_session);
+    defer term.deinit(alloc);
+
+    const out = try serializeCommandRange(alloc, &term, 1, 1);
+    defer alloc.free(out);
+
+    try testing.expectEqualStrings("echo four\nfour\n", out);
+}
+
+test "serializeCommandRange clamps end beyond available and returns all blocks" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_range_session);
+    defer term.deinit(alloc);
+
+    // 1..99 far exceeds the four available blocks; clamp to all of them,
+    // chronological, blank-line separated. The trailing empty prompt is skipped.
+    const out = try serializeCommandRange(alloc, &term, 1, 99);
+    defer alloc.free(out);
+
+    try testing.expectEqualStrings(
+        "echo one\none\n\necho two\ntwo\n\necho three\nthree\n\necho four\nfour\n",
+        out,
+    );
+}
+
+test "serializeCommandRange with start beyond available returns empty, not error" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, osc_range_session);
+    defer term.deinit(alloc);
+
+    // Only four blocks exist; a range starting past them is empty (not an error;
+    // error.NoSemanticPrompts is reserved for no OSC 133 prompts at all).
+    const out = try serializeCommandRange(alloc, &term, 50, 60);
+    defer alloc.free(out);
+
+    try testing.expectEqualStrings("", out);
+}
+
+test "serializeCommandRange errors when no semantic prompts present" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, "just some plain text\r\nno prompts here\r\n");
+    defer term.deinit(alloc);
+
+    try testing.expectError(
+        error.NoSemanticPrompts,
+        serializeCommandRange(alloc, &term, 1, 5),
+    );
 }
